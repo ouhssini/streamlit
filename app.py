@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import shutil
 import subprocess
 import time
 from urllib.parse import urlparse
@@ -8,11 +9,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
+
 # --- STREAMLIT CLOUD CHROMIUM AUTO-INSTALL ---
 @st.cache_resource
 def setup_playwright():
     """Ensures Chromium binaries are installed on Streamlit Cloud"""
     subprocess.run(["playwright", "install", "chromium"])
+
 
 setup_playwright()
 
@@ -28,7 +31,9 @@ st.title("📍 Google Maps Lead & Email Scraper")
 # Sidebar
 st.sidebar.header("Search Settings")
 query = st.sidebar.text_input("Search Query", "Plumbers in Miami FL")
-max_results = st.sidebar.slider("Number of Results", min_value=1, max_value=50, value=10)
+max_results = st.sidebar.slider(
+    "Number of Results", min_value=1, max_value=50, value=10
+)
 scrape_emails_toggle = st.sidebar.checkbox(
     "Deep Scan: Extract Emails from Websites", value=True
 )
@@ -43,6 +48,16 @@ start_button = st.sidebar.button("🚀 Start Scraping", type="primary")
 
 if "scraped_data" not in st.session_state:
     st.session_state.scraped_data = None
+
+
+def clean_text_icons(text: str) -> str:
+    """Removes Google Maps private-use font icons like  and  and cleans spacing."""
+    if not text or text == "N/A":
+        return "N/A"
+    # Remove Unicode Private Use Area characters (\ue000 to \uf8ff)
+    cleaned = re.sub(r"[\ue000-\uf8ff]", "", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if cleaned else "N/A"
 
 
 def extract_email_from_website(url: str) -> str:
@@ -63,7 +78,7 @@ def extract_email_from_website(url: str) -> str:
 
         # 1. Look for mailto: links
         mailto_matches = re.findall(
-            r'mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', html
+            r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", html
         )
         if mailto_matches:
             return mailto_matches[0]
@@ -85,6 +100,7 @@ def extract_email_from_website(url: str) -> str:
                     ".gif",
                     "sentry",
                     "wixpress",
+                    "example.com",
                 ]
             )
         ]
@@ -94,27 +110,25 @@ def extract_email_from_website(url: str) -> str:
         return "N/A"
 
 
-def clean_review_count(review_raw_str: str) -> int:
-    digits = re.sub(r"[^\d]", "", review_raw_str)
-    return int(digits) if digits else 0
-
-
-def scrape_google_maps(
-    search_query: str, count: int, scan_emails: bool, status_box
-):
+def scrape_google_maps(search_query: str, count: int, scan_emails: bool, status_box):
     results = []
 
     with sync_playwright() as p:
-        # Crucial container flags for Streamlit Cloud
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
+        system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+        launch_kwargs = {
+            "headless": True,
+            "args": [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--single-process",
             ],
-        )
+        }
+        if system_chromium:
+            launch_kwargs["executable_path"] = system_chromium
+
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -132,7 +146,7 @@ def scrape_google_maps(
         # Bypass Cookie/Consent Screen
         try:
             consent_btn = page.locator(
-                'button:has-text("Accept all"), button:has-text("Reject all"), button:has-text("I agree")'
+                'button:has-text("Accept all"), button:has-text("Reject all"), button:has-text("I agree"), button:has-text("Tout accepter")'
             ).first
             if consent_btn.is_visible(timeout=3000):
                 consent_btn.click()
@@ -145,7 +159,9 @@ def scrape_google_maps(
         try:
             page.wait_for_selector(feed_selector, timeout=12000)
         except Exception:
-            status_box.error("Could not find search results. Try a broader search query.")
+            status_box.error(
+                "Could not find search results. Try a broader search query."
+            )
             browser.close()
             return []
 
@@ -170,72 +186,64 @@ def scrape_google_maps(
                     break
 
                 cards[idx].click()
-                time.sleep(1.8)
+                time.sleep(2.0)  # Wait for panel to open and populate
 
-                # Name
-                name_loc = page.locator("h1.DUwDvf")
-                name = name_loc.inner_text() if name_loc.count() > 0 else "N/A"
+                # CRITICAL: Scope strictly to the open Details Pane
+                pane = page.locator('div[role="main"]')
 
-                # Rating
-                rating_loc = page.locator(
-                    'div.F7nice span[aria-hidden="true"]'
-                ).first
-                rating = (
-                    rating_loc.inner_text()
-                    if rating_loc.count() > 0
-                    else "N/A"
-                )
+                # 1. Business Name
+                name_loc = pane.locator("h1.DUwDvf").first
+                name = name_loc.inner_text().strip() if name_loc.count() > 0 else "N/A"
 
-                # Reviews
-                reviews_loc = page.locator(
-                    "div.F7nice span span[aria-label]"
-                ).first
-                raw_reviews = (
-                    reviews_loc.inner_text()
-                    if reviews_loc.count() > 0
-                    else "0"
-                )
-                number_of_reviews = clean_review_count(raw_reviews)
+                # 2. Rating & Review Count
+                rating = "N/A"
+                number_of_reviews = 0
 
-                # Category
-                cat_loc = page.locator(
-                    'button[jsaction="pane.rating.category"]'
-                ).first
+                rating_box = pane.locator("div.F7nice").first
+                if rating_box.count() > 0:
+                    box_text = rating_box.inner_text()
+
+                    # Extract Rating (e.g., 4.9 or 4,9)
+                    r_match = re.search(r"(\d+[.,]\d+)", box_text)
+                    if r_match:
+                        rating = r_match.group(1).replace(",", ".")
+
+                    # Extract Number of Reviews (e.g. (14) or (1,240))
+                    rev_match = re.search(r"\(([\d\s.,]+)\)", box_text)
+                    if rev_match:
+                        digits = re.sub(r"[^\d]", "", rev_match.group(1))
+                        number_of_reviews = int(digits) if digits else 0
+
+                # 3. Category
+                cat_loc = pane.locator('button[jsaction*="category"], span.DkEaL').first
                 category = (
-                    cat_loc.inner_text() if cat_loc.count() > 0 else "N/A"
+                    cat_loc.inner_text().strip() if cat_loc.count() > 0 else "N/A"
                 )
 
-                # Address
-                addr_loc = page.locator(
-                    'button[data-item-id="address"]'
-                ).first
-                address = (
-                    addr_loc.inner_text() if addr_loc.count() > 0 else "N/A"
-                )
-
-                # Website
-                web_loc = page.locator(
-                    'a[data-item-id="authority"], a[aria-label*="website" i]'
-                ).first
+                # 4. Website (Strictly scoped inside pane to avoid inheriting other cards)
+                web_loc = pane.locator('a[data-item-id="authority"]').first
                 website = "N/A"
-                if web_loc.count() > 0:
-                    website = web_loc.get_attribute("href") or "N/A"
+                if web_loc.count() > 0 and web_loc.is_visible():
+                    href = web_loc.get_attribute("href")
+                    if href and "google.com" not in href:
+                        website = href
 
-                has_website = (
-                    "No"
-                    if (website == "N/A" or not website or website.strip() == "")
-                    else "Yes"
-                )
+                has_website = "Yes" if website != "N/A" else "No"
 
-                # Phone
-                phone_loc = page.locator(
-                    'button[data-item-id^="phone:tel:"]'
-                ).first
-                phone = (
-                    phone_loc.inner_text() if phone_loc.count() > 0 else "N/A"
-                )
+                # 5. Phone
+                phone_loc = pane.locator('button[data-item-id^="phone:tel:"]').first
+                phone = "N/A"
+                if phone_loc.count() > 0:
+                    phone = clean_text_icons(phone_loc.inner_text())
 
-                # Email
+                # 6. Address
+                addr_loc = pane.locator('button[data-item-id="address"]').first
+                address = "N/A"
+                if addr_loc.count() > 0:
+                    raw_addr = clean_text_icons(addr_loc.inner_text())
+                    address = raw_addr.replace("\n", ", ").strip(", ")
+
+                # 7. Email (ONLY searched if business actually has a website)
                 email = "N/A"
                 if scan_emails and has_website == "Yes":
                     email = extract_email_from_website(website)
@@ -250,7 +258,7 @@ def scrape_google_maps(
                         "Rating": rating,
                         "Number of Reviews": number_of_reviews,
                         "Category": category,
-                        "Address": address.replace("\n", ", "),
+                        "Address": address,
                     }
                 )
 
