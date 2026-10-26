@@ -6,6 +6,21 @@ import pandas as pd
 from playwright.sync_api import sync_playwright
 import requests
 import streamlit as st
+import os
+import subprocess
+
+# Auto-install Playwright Chromium binary if missing on Streamlit Cloud
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    pass
+
+@st.cache_resource
+def install_playwright():
+    subprocess.run(["playwright", "install", "chromium"])
+
+install_playwright()
+
 
 st.set_page_config(
     page_title="Google Maps Lead & Email Scraper", page_icon="📍", layout="wide"
