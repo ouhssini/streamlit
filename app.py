@@ -1,41 +1,37 @@
 import io
+import os
 import re
+import subprocess
 import time
 from urllib.parse import urlparse
 import pandas as pd
-from playwright.sync_api import sync_playwright
 import requests
 import streamlit as st
-import os
-import subprocess
 
-# Auto-install Playwright Chromium binary if missing on Streamlit Cloud
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    pass
-
+# --- STREAMLIT CLOUD CHROMIUM AUTO-INSTALL ---
 @st.cache_resource
-def install_playwright():
+def setup_playwright():
+    """Ensures Chromium binaries are installed on Streamlit Cloud"""
     subprocess.run(["playwright", "install", "chromium"])
 
-install_playwright()
+setup_playwright()
 
+from playwright.sync_api import sync_playwright
 
+# --- UI SETUP ---
 st.set_page_config(
     page_title="Google Maps Lead & Email Scraper", page_icon="📍", layout="wide"
 )
 
 st.title("📍 Google Maps Lead & Email Scraper")
 
-# Sidebar Controls
+# Sidebar
 st.sidebar.header("Search Settings")
 query = st.sidebar.text_input("Search Query", "Plumbers in Miami FL")
 max_results = st.sidebar.slider("Number of Results", min_value=1, max_value=50, value=10)
 scrape_emails_toggle = st.sidebar.checkbox(
     "Deep Scan: Extract Emails from Websites", value=True
 )
-headless = st.sidebar.checkbox("Headless Mode (Hide Browser)", value=True)
 
 st.sidebar.header("Filter Results")
 filter_option = st.sidebar.selectbox(
@@ -65,18 +61,17 @@ def extract_email_from_website(url: str) -> str:
         resp = requests.get(url, headers=headers, timeout=5, verify=False)
         html = resp.text
 
-        # 1. Check for mailto: links first
+        # 1. Look for mailto: links
         mailto_matches = re.findall(
             r'mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', html
         )
         if mailto_matches:
             return mailto_matches[0]
 
-        # 2. General Email Regex fallback
+        # 2. General Email Regex
         email_pattern = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
         emails = re.findall(email_pattern, html)
 
-        # Filter out junk (images, fonts, placeholders)
         filtered = [
             e
             for e in emails
@@ -100,18 +95,26 @@ def extract_email_from_website(url: str) -> str:
 
 
 def clean_review_count(review_raw_str: str) -> int:
-    """Extracts only digits from review string (e.g. '(1,240)' -> 1240)."""
     digits = re.sub(r"[^\d]", "", review_raw_str)
     return int(digits) if digits else 0
 
 
 def scrape_google_maps(
-    search_query: str, count: int, is_headless: bool, scan_emails: bool, status_box
+    search_query: str, count: int, scan_emails: bool, status_box
 ):
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=is_headless, slow_mo=50)
+        # Crucial container flags for Streamlit Cloud
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -140,15 +143,12 @@ def scrape_google_maps(
         # Locate Feed
         feed_selector = 'div[role="feed"]'
         try:
-            page.wait_for_selector(feed_selector, timeout=10000)
+            page.wait_for_selector(feed_selector, timeout=12000)
         except Exception:
-            status_box.error(
-                "Could not find search results feed. Try a broader search query."
-            )
+            status_box.error("Could not find search results. Try a broader search query.")
             browser.close()
             return []
 
-        # Scroll to load listings
         status_box.info("Scrolling feed to load listings...")
         feed = page.locator(feed_selector)
 
@@ -160,7 +160,7 @@ def scrape_google_maps(
             time.sleep(1.5)
 
         total_to_scrape = min(len(listings), count)
-        status_box.info(f"Scraping details for {total_to_scrape} places...")
+        status_box.info(f"Scraping {total_to_scrape} locations...")
         progress_bar = st.progress(0)
 
         for idx in range(total_to_scrape):
@@ -186,7 +186,7 @@ def scrape_google_maps(
                     else "N/A"
                 )
 
-                # Number of Reviews
+                # Reviews
                 reviews_loc = page.locator(
                     "div.F7nice span span[aria-label]"
                 ).first
@@ -235,7 +235,7 @@ def scrape_google_maps(
                     phone_loc.inner_text() if phone_loc.count() > 0 else "N/A"
                 )
 
-                # Email Scraping (via Website)
+                # Email
                 email = "N/A"
                 if scan_emails and has_website == "Yes":
                     email = extract_email_from_website(website)
@@ -273,7 +273,7 @@ if start_button:
     else:
         with st.spinner("Extracting data and hunting emails..."):
             data = scrape_google_maps(
-                query, max_results, headless, scrape_emails_toggle, status_box
+                query, max_results, scrape_emails_toggle, status_box
             )
             if data:
                 st.session_state.scraped_data = pd.DataFrame(data)
@@ -281,15 +281,12 @@ if start_button:
                     f"Done! Scraped {len(data)} businesses successfully."
                 )
             else:
-                status_box.error(
-                    "No data was extracted. Try checking your internet connection or search query."
-                )
+                status_box.error("No data extracted. Verify your search term.")
 
-# Display Table & Excel Download
+# Display & Excel Download
 if st.session_state.scraped_data is not None:
     df = st.session_state.scraped_data.copy()
 
-    # Apply Website Filter
     if filter_option == "Only Without Website (No)":
         df = df[df["Has Website"] == "No"]
     elif filter_option == "Only With Website (Yes)":
@@ -298,7 +295,6 @@ if st.session_state.scraped_data is not None:
     st.subheader(f"Results ({len(df)} records displayed)")
     st.dataframe(df, use_container_width=True)
 
-    # Export to Excel in Memory
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Leads")
